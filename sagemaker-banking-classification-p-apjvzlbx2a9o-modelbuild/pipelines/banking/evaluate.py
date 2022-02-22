@@ -1,4 +1,3 @@
-
 """Evaluation script for measuring mean squared error."""
 import json
 import logging
@@ -25,18 +24,23 @@ if __name__ == "__main__":
 
     logger.debug("Loading xgboost model.")
     model = pickle.load(open("xgboost-model", "rb"))
-
+    
     logger.debug("Reading test data.")
     test_path = "/opt/ml/processing/test/test.csv"
     df = pd.read_csv(test_path, header=None)
 
+#     logger.debug("Reading test data.")
+#     y_test = df.iloc[:, 0].to_numpy()
+#     df.drop(df.columns[0], axis=1, inplace=True)
+# #     df.drop('y', axis=1, inplace=True)
+#     X_test = xgboost.DMatrix(df.values)
+    
     logger.debug("Reading test data.")
     y_test = df.iloc[:, 0].to_numpy()
     df.drop(df.columns[0], axis=1, inplace=True)
-#     df.drop('y', axis=1, inplace=True)
     X_test = xgboost.DMatrix(df.values)
     ######
-
+    
     logger.info("Performing predictions against test data.")
     predictions = model.predict(X_test)
     predictions = np.round(predictions)

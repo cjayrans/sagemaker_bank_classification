@@ -6,19 +6,18 @@ import sagemaker.session
 
 from sagemaker.estimator import Estimator
 from sagemaker.inputs import TrainingInput
+from sagemaker.workflow.execution_variables import ExecutionVariables
 from sagemaker.processing import (
     ProcessingInput,
     ProcessingOutput,
     ScriptProcessor,
 )
 from sagemaker.sklearn.processing import SKLearnProcessor
-from sagemaker.workflow.conditions import (
-    ConditionGreaterThanOrEqualTo,
-)
+from sagemaker.workflow.functions import JsonGet
 from sagemaker.workflow.condition_step import (
     ConditionStep,
-    JsonGet,
 )
+from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
 from sagemaker.model_metrics import (
     MetricsSource,
     ModelMetrics,
@@ -31,9 +30,19 @@ from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.steps import (
     ProcessingStep,
-    TrainingStep,
+    TuningStep,
+    CacheConfig,
 )
-from sagemaker.workflow.step_collections import RegisterModel
+from sagemaker.workflow.step_collections import RegisterModel, CreateModelStep
+from sagemaker import Model
+from sagemaker.xgboost import XGBoostPredictor
+from sagemaker.tuner import (
+    ContinuousParameter,
+    IntegerParameter,
+    HyperparameterTuner,
+    WarmStartConfig,
+    WarmStartTypes,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -95,6 +104,9 @@ def get_pipeline(
         name="ModelApprovalStatus",
         default_value="PendingManualApproval",  # ModelApprovalStatus can be set to a default of "Approved" if you don't want manual approval.
     )
+    
+    cache_config = CacheConfig(enable_caching=True, expire_after="1d")
+    
     input_data = ParameterString(
         name="InputDataUrl",
         default_value=os.path.join("s3://",default_bucket, base_job_prefix, 'data/bank-additional-full.csv'),  # Change this to point to the s3 location of your raw input data.
@@ -119,53 +131,27 @@ def get_pipeline(
             ProcessingOutput(
                 output_name="train",
                 source="/opt/ml/processing/train",
-                destination=Join(
-                    on="/",
-                    values=[
-                        "s3:/",
-                        default_bucket,
-                        data_repo_prefix,
-                        ExecutionVariables.PIPELINE_EXECUTION_ID,
-                        "PreprocessBankingDataForHPO",
-                    ],
-                ),
+                destination=f"s3://{default_bucket}/{data_repo_prefix}/{ExecutionVariables.PIPELINE_EXECUTION_ID}/PreprocessBankingDataForHPO",
             ),
             ProcessingOutput(
                 output_name="validation",
                 source="/opt/ml/processing/validation",
-                destination=Join(
-                    on="/",
-                    values=[
-                        "s3:/",
-                        default_bucket,
-                        data_repo_prefix,
-                        ExecutionVariables.PIPELINE_EXECUTION_ID,
-                        "PreprocessBankingDataForHPO",
-                    ],
-                ),
+                destination=f"s3://{default_bucket}/{data_repo_prefix}/{ExecutionVariables.PIPELINE_EXECUTION_ID}/PreprocessBankingDataForHPO",
             ),
             ProcessingOutput(
                 output_name="test",
                 source="/opt/ml/processing/test",
-                destination=Join(
-                    on="/",
-                    values=[
-                        "s3:/",
-                        default_bucket,
-                        data_repo_prefix,
-                        ExecutionVariables.PIPELINE_EXECUTION_ID,
-                        "PreprocessBankingDataForHPO",
-                    ],
-                ),
+                destination=f"s3://{default_bucket}/{data_repo_prefix}/{ExecutionVariables.PIPELINE_EXECUTION_ID}/PreprocessBankingDataForHPO",
             ),
         ],
-        code=os.path.join(BASE_DIR, "preprocess.py"), ##"preprocess.py",
+        code=os.path.join(BASE_DIR, "preprocess.py"), 
         job_arguments=["--input-data", input_data],
     )
 
     # Training step for generating model artifacts
 #     model_path = f"s3://{sagemaker_session.default_bucket()}/{base_job_prefix}/BankingTrain"
-    model_path = f"s3://{default_bucket}/{base_job_prefix}/BankingTrain"
+    model_path = f"s3://{default_bucket}/{base_job_prefix}/BankingTopModel"
+    
     image_uri = sagemaker.image_uris.retrieve(
         framework="xgboost",  # we are using the Sagemaker built in xgboost algorithm
         region=region,
@@ -181,13 +167,14 @@ def get_pipeline(
         base_job_name=f"{base_job_prefix}/banking-train",
         sagemaker_session=sagemaker_session,
         role=role,
-    )    
+    )        
     xgb_train.set_hyperparameters(
         eval_metric="logloss",
         objective="binary:logistic",  # Define the object metric for the training job
-        num_round=100,
-        eta=0.2,
+        num_round=50,
+        eta=0.1,
         gamma=4,
+        min_child_weight=3,
         subsample=0.7,
         silent=0,
         scale_pos_weight=7.7, # Based on imbalance_ratio calculation listed in the preprocess.py script
@@ -199,7 +186,6 @@ def get_pipeline(
         "alpha": ContinuousParameter(0.01, 10.0),  # , scaling_type="Logarithmic"
         "lambda": ContinuousParameter(0.01, 10.0),  # , scaling_type="Logarithmic"
         "max_depth": IntegerParameter(1, 10),
-        "min_child_weight": IntegerParameter(1, 8),
     }
 
     tuner_log = HyperparameterTuner(
@@ -230,20 +216,22 @@ def get_pipeline(
         },
         cache_config=cache_config,
     )
-    model_bucket_key = f"{default_bucket}/{base_job_prefix}/BankingTrain"
+    
+    model_bucket_key = f"{default_bucket}/{base_job_prefix}/BankingTopModel"
     best_model = Model(
         image_uri=image_uri,
-        model_data=step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key),
+        model_data=step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key), # model_path
         sagemaker_session=sagemaker_session,
         role=role,
         predictor_cls=XGBoostPredictor,
     )
 
     step_create_first = CreateModelStep(
-        name="CreateTopModel",
+        name="BankingTopModel",
         model=best_model,
         inputs=sagemaker.inputs.CreateModelInput(instance_type="ml.m4.large"),
     )
+
 # If we wanted to bypass tuning and jump straight to tuning we would use the code below
     #     step_train = TrainingStep(
 #         name="HPTuning",
@@ -274,17 +262,19 @@ def get_pipeline(
         sagemaker_session=sagemaker_session,
         role=role,
     )
+    
     evaluation_report = PropertyFile(
-        name="BestTuningModelEvaluationReport",
+        name="EvaluationReport",
         output_name="evaluation",
         path="evaluation.json",
     )
+    
     step_eval = ProcessingStep(
         name="EvaluateTopModel",
         processor=script_eval,
         inputs=[
             ProcessingInput(
-                source=step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key),
+                source=step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key),# model_path
                 destination="/opt/ml/processing/model",
             ),
             ProcessingInput(
@@ -299,6 +289,7 @@ def get_pipeline(
         property_files=[evaluation_report],
         cache_config=cache_config,
     )
+    
 
     # Register model step that will be conditionally executed
     model_metrics = ModelMetrics(
@@ -311,37 +302,24 @@ def get_pipeline(
             content_type="application/json",
         )
     )
-
-    # Register model step that will be conditionally executed
-#     step_register = RegisterModel(
-#         name="CustomerChurnRegisterModel",
-#         estimator=xgb_train,
-#         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-#         content_types=["text/csv"],
-#         response_types=["text/csv"],
-#         inference_instances=["ml.t2.medium", "ml.m5.large"],
-#         transform_instances=["ml.m5.large"],
-#         model_package_group_name=model_package_group_name,
-#         approval_status=model_approval_status,
-#         model_metrics=model_metrics,
-#     )
     
     step_register_best = RegisterModel(
         name="RegisterBestBankingModel",
         estimator=xgb_train,
-        model_data=best_model, ## step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key),
+        model_data=step_tuning.get_top_model_s3_uri(top_k=0, s3_bucket=model_bucket_key), # best_model, model_path 
         content_types=["text/csv"],
-        response_types=["application/json"], # "text/csv"
+        response_types=["text/csv"], # "application/json""text/csv"
         inference_instances=["ml.t2.medium", "ml.m5.large"],
         transform_instances=["ml.m5.large"],
         model_package_group_name=model_package_group_name,
         approval_status=model_approval_status,
         model_metrics=model_metrics,
     )
+    
     # Condition step for evaluating model quality and branching execution
     cond_lte = ConditionGreaterThanOrEqualTo(
         left=JsonGet(
-            step_name=, step_eval# step_eval.name
+            step_name= "EvaluateTopModel", # step_eval.name 
             property_file=evaluation_report,
             json_path="binary_classification_metrics.auc.value",
         ),
@@ -353,6 +331,7 @@ def get_pipeline(
         if_steps=[step_register_best],
         else_steps=[],
     )
+    
     # Pipeline instance
     pipeline = Pipeline(
         name=pipeline_name, #"tuning-step-pipeline",

@@ -136,7 +136,7 @@ if __name__ == "__main__":
     logger.info("Applying transforms.")
     df['y'] = df['y'].map({'yes':1, 'no':0})
     y = df.pop("y")
-    X_pre = preprocess.fit_transform(df)20.
+    X_pre = preprocess.fit_transform(df)
     
     # estimate scale_pos_weight value
 #     counter = Counter(y)
@@ -155,7 +155,6 @@ if __name__ == "__main__":
             return np.array(feature_in)[estimator.get_support()]
         else:
             return feature_in
-
 
     def get_ct_feature_names(ct):
         # handles all estimators, pipelines inside ColumnTransfomer
@@ -180,9 +179,8 @@ if __name__ == "__main__":
 
     X = pd.DataFrame(X_pre, 
                  columns=get_ct_feature_names(preprocess))
-
+    
     X['y'] = y
-#     X['y'] = X['y'].astype(np.float64)
     
     # Move our target column from the first to the last position (column) in the data frame
     temp_cols = list(X.columns)
@@ -190,7 +188,6 @@ if __name__ == "__main__":
     X = X[temp_cols]
 
     logger.info("Splitting %d rows of data into train, validation, test datasets.", len(X))
-#     np.random.shuffle(X)
     train, validation, test = np.split(X, [int(0.7 * len(X)), int(0.85 * len(X))])
 
     logger.info("Writing out datasets to %s.", base_dir)
